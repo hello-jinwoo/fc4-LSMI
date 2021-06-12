@@ -4,8 +4,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torchvision.models as models
 from torch.utils.tensorboard import SummaryWriter
-from model import U_Net as U_Net
 from classes.fc4.ModelFC4 import ModelFC4
+from classes.training.LossTracker import LossTracker
+from classes.training.Evaluator import Evaluator
 import sys
 
 class Solver():
@@ -54,9 +55,10 @@ class Solver():
 
 		if self.mode == 'test':
 			# load model from checkpoint
-			ckpt = os.path.join(self.model_path,'best.pt')
+			ckpt = os.path.join(self.model_path,'model.pth')
+			model.load(ckpt)
 			print("[Model]\tLoad model from checkpoint :", ckpt)
-			self.net.load_state_dict(torch.load(ckpt),strict=False)
+			# self.net.load_state_dict(torch.load(ckpt),strict=False)
 
 		# multi-GPU
 		if torch.cuda.device_count() > 1 and self.multi_gpu == 1: 
@@ -64,17 +66,22 @@ class Solver():
 
 		# gpu & optimizer
 		self.net.to(self.device)
-		self.optimizer = torch.optim.Adam(list(self.net.parameters()), self.lr)
+		# self.optimizer = torch.optim.Adam(list(self.net.parameters()), self.lr)
+		self.net.module.set_optimizer(self.lr)
 		print("[Model]\tBuild complete.")
-		self.net.print_network()
+		# self.net.module.print_network()
 
 	def train(self):
 		print("[Train]\tStart training process.")
 		best_val_score = 987654321.
+		train_loss, val_loss = LossTracker(), LossTracker()
+		evaluator = Evaluator()
+		best_val_loss, best_metrics = 100.0, evaluator.get_best_metrics()
 
 		for epoch in range(self.num_epochs):
 			# Train
-			self.net.train()
+			# self.net.train()
+			self.net.module.train_mode()
 			for i, batch in enumerate(self.train_loader):
 
 				input_tensor = batch["input"].to(self.device)
@@ -82,34 +89,46 @@ class Solver():
 				# gt_tensor = torch.cat((gt_illum[:,0:1],gt_illum[:,2:4],gt_illum[:,5:6]),1).to(self.device)   # delete G channel
 				gt_tensor = batch['illum1'].to(self.device)
 
-				output_tensor = self.net(input_tensor)
-				loss = self.criterion(output_tensor.float(), gt_tensor.float())
-				self.net.zero_grad()
-				loss.backward()
-				self.optimizer.step()
+				# output_tensor = self.net(input_tensor)
+				# loss = self.criterion(output_tensor.float(), gt_tensor.float())
+				# self.net.zero_grad()
+				# loss.backward()
+				# self.optimizer.step()
+
+				self.net.module.reset_gradient()
+				pred = self.net.module.predict(input_tensor)
+				loss = self.net.module.optimize(pred, gt_tensor)
+				train_loss.update(loss)
+
 
 				# print training log & tensorboard logging (every iteration)
 				if i % 10 == 0:
 					print(f'[Train] Epoch [{epoch+1} / {self.num_epochs}] | ' \
 						  f'Batch [{i+1} / {len(self.train_loader)}] | ' \
-						  f'Loss: {loss.item():.6f}')
-				self.writer.add_scalar('Loss/train', loss.item(), epoch*len(self.train_loader)+i)
+						  f'Loss: {loss:.6f}')
+				self.writer.add_scalar('Loss/train', loss, epoch*len(self.train_loader)+i)
 
 			# Validation
 			val_score = 0
 			n_val = 0
-			self.net.eval()
+			# self.net.eval()
+			evaluator.reset_errors()
+			self.net.module.evaluation_mode()
 			for i, batch in enumerate(self.val_loader):
 				input_tensor = batch["input"].to(self.device)
-				# gt_illum = torch.cat((batch["illum1"],batch["illum2"]),1)
-				# gt_tensor = torch.cat((gt_illum[:,0:1],gt_illum[:,2:4],gt_illum[:,5:6]),1).to(self.device)   # delete G channel
 				gt_tensor = batch['illum1'].to(self.device)
 
 				minibatch_size = len(input_tensor)
 				n_val += minibatch_size
 
-				output_tensor = self.net(input_tensor)
-				loss = float(self.criterion(output_tensor.float(),gt_tensor.float()))
+				# output_tensor = self.net(input_tensor)
+				# loss = float(self.criterion(output_tensor.float(),gt_tensor.float()))
+				# val_score += loss * minibatch_size
+
+				pred = self.net.module.predict(input_tensor)
+				loss = self.net.module.get_angular_loss(pred, gt_tensor).item()
+				val_loss.update(loss)
+				evaluator.add_error(loss)
 				val_score += loss * minibatch_size
 
 			val_score /= n_val
@@ -120,21 +139,11 @@ class Solver():
 			self.writer.add_scalar('Loss/validation', val_score, epoch)
 
 			# Save best model
-			if val_score < best_val_score:
-				best_val_score = val_score
-				if self.multi_gpu == 1:
-					best_net = self.net.module.state_dict()
-				else:
-					best_net = self.net.state_dict()
-				torch.save(best_net, os.path.join(self.model_path, 'best.pt'))
-				print(f'Best validation score : {best_val_score:.6f}')
-			# Save every N epoch
-			elif self.save_epoch > 0 and epoch % self.save_epoch == self.save_epoch - 1:
-				if self.multi_gpu == 1:
-					state_dict = self.net.module.state_dict()
-				else:
-					state_dict = self.net.state_dict()
-				torch.save(best_net, os.path.join(self.model_path, str(epoch)+'.pt'))
+			if 0 < val_loss.avg < best_val_loss:
+				best_val_loss = val_loss.avg
+				# best_metrics = evaluator.update_best_metrics()
+				print("Saving new best model... \n")
+				self.net.save(os.path.join(self.model_path, "model.pth"))
 
 	def test(self):
 		self.net.eval()
